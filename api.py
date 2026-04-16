@@ -46,13 +46,11 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "https://gym-pose-estimation-webapp.vercel.app",
-        "http://localhost:5173",
     ],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 
 BASE_DIR = Path(__file__).resolve().parent
 UPLOADS_DIR = BASE_DIR / "uploads"
