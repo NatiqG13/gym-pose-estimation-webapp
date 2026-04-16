@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 
-const API_BASE = "http://127.0.0.1:8000";
+const API_BASE = "https://gym-pose-estimation-webapp.onrender.com";
 
 function App() {
   const [exercise, setExercise] = useState("curl");
