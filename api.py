@@ -16,6 +16,8 @@ This file exposes a small backend API so a client can:
 
 from __future__ import annotations
 
+import csv
+import json
 import os
 import shutil
 import uuid
@@ -36,7 +38,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from analysis_service import run_analysis
 
 
 app = FastAPI(title="Gym Pose API")
@@ -74,6 +75,46 @@ class ChatMessage(BaseModel):
 class ChatRequest(BaseModel):
     analysis_id: int
     messages: List[ChatMessage]
+
+
+def get_run_analysis():
+    """
+    Imports the heavy analysis pipeline only when live video analysis needs it.
+    """
+    from analysis_service import run_analysis
+    return run_analysis
+
+
+def load_json_file(path):
+    """
+    Loads a JSON file from disk.
+    """
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def load_demo_reps_csv(path):
+    """
+    Loads precomputed demo rep rows from CSV into the format expected by the app.
+    """
+    reps = []
+
+    with open(path, "r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+
+        for row in reader:
+            rep = {
+                "rep_index": int(float(row.get("rep_index") or len(reps) + 1)),
+                "start_idx": int(float(row.get("start_idx") or row.get("start_frame") or row.get("start") or 0)),
+                "end_idx": int(float(row.get("end_idx") or row.get("end_frame") or row.get("end") or 0)),
+                "duration": float(row.get("duration") or row.get("rep_duration") or 0.0),
+                "label": str(row.get("label") or "fail").strip().lower(),
+                "reason": str(row.get("reason") or row.get("fail_reason") or "").strip(),
+                "rom": float(row.get("rom") or row.get("ROM") or 0.0),
+            }
+            reps.append(rep)
+
+    return reps
 
 
 def to_public_url(path_value):
@@ -704,6 +745,8 @@ async def analyze_video(
 
         init_db()
 
+        run_analysis = get_run_analysis()
+
         result = run_analysis(
             video_path=str(upload_path),
             exercise=exercise,
@@ -754,54 +797,120 @@ def analyze_demo_video(
     save_reps_json: bool = Form(False),
 ) -> dict:
     """
-    Runs the analysis pipeline on the bundled demo curl video.
+    Loads precomputed demo results instead of running live YOLO inference.
+
+    This keeps the hosted demo reliable on small cloud instances while the full
+    pipeline remains available through /analyze or local runs.
     """
     exercise = exercise.strip().lower()
 
     if exercise != "curl":
         raise HTTPException(status_code=400, detail="Demo mode currently supports curl only.")
 
-    if not DEMO_VIDEO_PATH.exists():
+    demo_dir = BASE_DIR / "demo_outputs"
+    if not demo_dir.exists():
         raise HTTPException(
             status_code=500,
-            detail=f"Demo video not found at {DEMO_VIDEO_PATH}",
+            detail="demo_outputs folder not found. Add precomputed demo artifacts first.",
         )
 
-    calib_file = BASE_DIR / calibration_path
-    if not calib_file.exists():
+    summary_src = demo_dir / "summary.json"
+    reps_src = demo_dir / "reps.csv"
+
+    # Support your current generated filenames too, so you do not have to rename
+    # files locally unless you want to.
+    if not summary_src.exists():
+        summary_src = demo_dir / "curl_summary.json"
+
+    if not reps_src.exists():
+        reps_src = demo_dir / "curl_reps.csv"
+
+    if not summary_src.exists():
         raise HTTPException(
-            status_code=400,
-            detail=f"Calibration file not found: {calibration_path}",
+            status_code=500,
+            detail="Missing demo summary file. Expected demo_outputs/summary.json or demo_outputs/curl_summary.json.",
+        )
+
+    if not reps_src.exists():
+        raise HTTPException(
+            status_code=500,
+            detail="Missing demo reps file. Expected demo_outputs/reps.csv or demo_outputs/curl_reps.csv.",
         )
 
     run_id = str(uuid.uuid4())[:8]
     output_dir = RUNS_DIR / f"{exercise}_demo_{run_id}"
     output_dir.mkdir(exist_ok=True)
 
-    init_db()
-
     try:
-        result = run_analysis(
-            video_path=str(DEMO_VIDEO_PATH),
-            exercise=exercise,
-            calibration_path=str(calib_file),
-            output_dir=str(output_dir),
-            save_video=save_video,
-            save_plots=save_plots,
-            save_angle_csv=save_angle_csv,
-            save_reps_json=save_reps_json,
+        for item in demo_dir.iterdir():
+            if item.is_file():
+                shutil.copy2(item, output_dir / item.name)
+
+        summary_path = output_dir / summary_src.name
+        reps_csv_path = output_dir / reps_src.name
+
+        # Also create generic copies so artifact links are predictable.
+        generic_summary_path = output_dir / "summary.json"
+        generic_reps_path = output_dir / "reps.csv"
+
+        if summary_path.name != "summary.json":
+            shutil.copy2(summary_path, generic_summary_path)
+        else:
+            generic_summary_path = summary_path
+
+        if reps_csv_path.name != "reps.csv":
+            shutil.copy2(reps_csv_path, generic_reps_path)
+        else:
+            generic_reps_path = reps_csv_path
+
+        summary = load_json_file(generic_summary_path)
+        reps = load_demo_reps_csv(generic_reps_path)
+
+        rep_count = int(summary.get("rep_count", len(reps)) or len(reps))
+        pass_count = int(
+            summary.get(
+                "pass_count",
+                sum(1 for rep in reps if str(rep.get("label", "")).lower() == "pass"),
+            )
+            or 0
         )
+        fail_count = int(
+            summary.get(
+                "fail_count",
+                sum(1 for rep in reps if str(rep.get("label", "")).lower() != "pass"),
+            )
+            or 0
+        )
+
+        result = {
+            "summary": {
+                "exercise": summary.get("exercise", exercise),
+                "joint_name": summary.get("joint_name", "right_elbow"),
+                "rep_count": rep_count,
+                "pass_count": pass_count,
+                "fail_count": fail_count,
+                "calibration_file": summary.get("calibration_file", calibration_path),
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+            },
+            "artifacts": {
+                "summary_json": str(generic_summary_path),
+                "reps_csv": str(generic_reps_path),
+            },
+            "reps": reps,
+        }
+
+        init_db()
 
         saved = save_analysis_result(
             exercise=exercise,
-            original_filename=DEMO_VIDEO_PATH.name,
+            original_filename="curl_precomputed_demo",
             uploaded_file_path=str(DEMO_VIDEO_PATH),
             output_dir=str(output_dir),
             result=result,
         )
 
         return {
-            "message": "Demo analysis completed successfully.",
+            "message": "Demo analysis loaded from precomputed results.",
             "run_id": run_id,
             "analysis_id": saved["analysis_id"],
             "uploaded_file": str(DEMO_VIDEO_PATH),

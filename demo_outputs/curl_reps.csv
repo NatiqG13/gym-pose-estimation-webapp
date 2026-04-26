@@ -1,0 +1,5 @@
+rep_index,start_idx,end_idx,duration,label,reason,rom
+1,35,154,4.0,pass,"Good rep",110.79780916053352
+2,210,332,4.1,pass,"Good rep",100.5075895393591
+3,380,517,4.6,pass,"Good rep",92.50062400343587
+4,557,695,4.633333333333334,pass,"Good rep",90.52929847835313
